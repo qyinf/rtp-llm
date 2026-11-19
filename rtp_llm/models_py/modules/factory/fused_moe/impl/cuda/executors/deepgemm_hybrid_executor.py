@@ -37,6 +37,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.type import ExecutorType
 from rtp_llm.models_py.triton_kernels.common.activation import (
     MaskedSiluInputLayout,
     create_packed_scale_tensor,
+    prepare_masked_silu_fp8_launcher,
     silu_and_mul,
     silu_and_mul_masked_post_quant_packed_fwd,
     silu_mul_masked_fp8_post_quant_fwd,
@@ -304,6 +305,25 @@ class DeepGemmHybridExecutor(FusedMoeExpertExecutor):
             and not is_deep_gemm_e8m0_used()
         )
         self._sm90_prefill_silu_fp8 = self._sm90_mn_major_scales
+        self._sm90_contiguous_prefill_range = (
+            self._sm90_mn_major_scales
+            and os.environ.get("QWEN_MOE_SM90_CONTIG_PREFILL_RANGE", "1") == "1"
+        )
+        self._sm90_contiguous_live_rows = (
+            self._sm90_mn_major_scales
+            and os.environ.get("QWEN_MOE_SM90_CONTIG_LIVE_ROWS", "1") == "1"
+        )
+        masked_prefill_mode = os.environ.get("QWEN_MOE_SM90_MASKED_PREFILL", "cached_subwarp")
+        self._masked_prefill_subwarp = masked_prefill_mode in ("subwarp", "cached_subwarp")
+        self._masked_prefill_cache_launch = masked_prefill_mode == "cached_subwarp"
+        self._masked_prefill_parallel = (
+            masked_prefill_mode in ("1", "subwarp", "cached_subwarp")
+            and torch.cuda.get_device_capability(self.w13_weight.device) == (9, 0)
+            and (self.E, self.N) in ((512, 768), (256, 1280))
+            and self.K == 2560
+            and self.top_k == 10
+            and not is_deep_gemm_e8m0_used()
+        )
 
     def execute(
         self,
@@ -503,7 +523,14 @@ class DeepGemmHybridExecutor(FusedMoeExpertExecutor):
             num_recv_tokens_per_expert = payload.expert_tokens_meta.expert_num_tokens
 
             token_num = hidden_states_fp8.shape[0]
-            mn_major_scales = self._sm90_mn_major_scales and token_num in (16, 32, 64)
+            parallel_prefill = (
+                self._masked_prefill_parallel
+                and 4096 <= token_num < 8192
+                and not _is_cuda_graph_warmup_or_capture()
+            )
+            mn_major_scales = parallel_prefill or (
+                self._sm90_mn_major_scales and token_num in (16, 32, 64)
+            )
             num_experts = num_recv_tokens_per_expert.shape[0]
             max_token_num = token_num * self.top_k
             token_num_mean_per_expert = ceil_div(max_token_num, num_experts)
@@ -620,17 +647,30 @@ class DeepGemmHybridExecutor(FusedMoeExpertExecutor):
                     device=hidden_states_fp8_device,
                     mn_major=mn_major_scales,
                 )
-                # SiLU Activation
-                silu_mul_masked_fp8_post_quant_fwd(
-                    input=upgate_output,
-                    output=down_input,
-                    output_scale=down_input_scale,
-                    quant_group_size=self.DEEPGEMM_BLOCK_SHAPE[0],
-                    masked_m=num_recv_tokens_per_expert,
-                    expected_m=expected_m,
-                    input_layout=MaskedSiluInputLayout.BATCH_TOKEN_ALIGNMENT,
-                    scale_ue8m0=is_deep_gemm_e8m0_used(),
-                )
+                launch_activation = None
+                if parallel_prefill and self._masked_prefill_cache_launch:
+                    launch_activation = prepare_masked_silu_fp8_launcher(
+                        hidden_states_fp8_device, self.num_experts_per_partition,
+                        alignment, self.N // 2, num_recv_tokens_per_expert,
+                    )
+                if launch_activation is not None:
+                    launch_activation(
+                        upgate_output, down_input, down_input_scale,
+                        num_recv_tokens_per_expert,
+                    )
+                else:
+                    silu_mul_masked_fp8_post_quant_fwd(
+                        input=upgate_output,
+                        output=down_input,
+                        output_scale=down_input_scale,
+                        quant_group_size=self.DEEPGEMM_BLOCK_SHAPE[0],
+                        masked_m=num_recv_tokens_per_expert,
+                        expected_m=expected_m,
+                        input_layout=MaskedSiluInputLayout.BATCH_TOKEN_ALIGNMENT,
+                        scale_ue8m0=is_deep_gemm_e8m0_used(),
+                        token_blocks=8 if parallel_prefill else None,
+                        use_subwarp=parallel_prefill and self._masked_prefill_subwarp,
+                    )
 
             # Free upgate_output
             dispose_tensor(upgate_output)
@@ -752,11 +792,16 @@ class DeepGemmHybridExecutor(FusedMoeExpertExecutor):
             )
 
         num_experts_local = num_recv_tokens_per_expert.shape[0]
-        mn_major_scales = self._sm90_mn_major_scales and hidden_states_fp8.shape[0] in (
-            8192,
-            32768,
+        token_num = hidden_states_fp8.shape[0]
+        mn_major_scales = self._sm90_mn_major_scales and (
+            token_num in (8192, 32768)
+            or (
+                self._sm90_contiguous_prefill_range
+                and not graph_layout
+                and 4096 <= token_num < 8192
+            )
         )
-        routed_tokens = hidden_states_fp8.shape[0] * topk_idx.shape[1]
+        routed_tokens = token_num * topk_idx.shape[1]
         if routed_tokens == 0:
             return CombineForwardPayload(
                 fused_expert_output=torch.zeros(
@@ -916,9 +961,14 @@ class DeepGemmHybridExecutor(FusedMoeExpertExecutor):
             )
         del input_tensor
         if mn_major_scales and self._sm90_prefill_silu_fp8:
-            down_input_fp8, down_input_scale = silu_mul_native_fp8(
-                gateup_output.view(-1, N)
-            )
+            gate_up = gateup_output.view(-1, N)
+            if self._sm90_contiguous_live_rows and not graph_layout:
+                down_input_fp8, down_input_scale = silu_mul_native_fp8(
+                    gate_up, expert_ids=m_indices, expert_end=expert_start_loc
+                )
+            else:
+                down_input_fp8, down_input_scale = silu_mul_native_fp8(gate_up)
+            del gate_up
             del gateup_output
             down_output = torch.empty(
                 (all_tokens, K),

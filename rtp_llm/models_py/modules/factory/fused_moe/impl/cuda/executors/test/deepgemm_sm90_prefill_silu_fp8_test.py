@@ -99,14 +99,22 @@ class DeepGemmSM90PrefillSiluFp8Test(unittest.TestCase):
         executor = self.executor
         executor.enable_cuda_graph = False
         executor._sm90_mn_major_scales = True
-        for rows in (8192, 32768):
+        for rows in (4096, 4800, 5200, 8191, 8192, 32768):
             for routing in ("uniform", "skewed", "all_local", "sparse", "remote"):
                 with self.subTest(rows=rows, routing=routing):
                     payload = make_prefill_payload(rows, routing)
                     executor._sm90_prefill_silu_fp8 = False
                     expected = invoke(executor, clone_payload(payload), False)
                     executor._sm90_prefill_silu_fp8 = True
-                    actual = invoke(executor, clone_payload(payload), False)
+                    with patch.object(
+                        owner, "silu_mul_native_fp8", wraps=silu_mul_native_fp8
+                    ) as fused:
+                        actual = invoke(executor, clone_payload(payload), False)
+                    if routing == "remote":
+                        fused.assert_not_called()
+                    else:
+                        fused.assert_called_once()
+                        self.assertIn("expert_end", fused.call_args.kwargs)
                     torch.cuda.synchronize()
                     torch.testing.assert_close(expected, actual, rtol=0, atol=0)
 
@@ -120,7 +128,7 @@ class DeepGemmSM90PrefillSiluFp8Test(unittest.TestCase):
         ):
             for masked, rows_list in (
                 (True, (16, 32, 64)),
-                (False, (2048, 8191, 8193, 32767, 32769)),
+                (False, (2048, 4095, 8193, 32767, 32769)),
             ):
                 executor.enable_cuda_graph = masked
                 executor._sm90_mn_major_scales = True
