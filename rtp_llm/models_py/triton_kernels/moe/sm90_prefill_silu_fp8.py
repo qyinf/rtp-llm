@@ -6,6 +6,11 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from rtp_llm.ops import compute_ops
+
+
+native_contiguous_silu_fp8 = getattr(compute_ops, "sm90_contiguous_silu_fp8", None)
+
 
 # Padded expert counts vary with routing even for a fixed input length.
 @triton.jit(do_not_specialize=["ROWS"])
@@ -72,8 +77,19 @@ def _silu_mul_live_rows(gate_up, expert_ids, expert_end, quantized, scales, rows
         gl.store(scale_out, gl.div_rn(1.0e-4, 448.0))
 
 
-def silu_mul_native_fp8(gate_up, *, expert_ids=None, expert_end=None):
+def silu_mul_native_fp8(
+    gate_up, *, expert_ids=None, expert_end=None, padding_bounds=None
+):
     """Produce FP8 values and MN-major FP32 scales for qualified SM90 MoE."""
+    if padding_bounds is not None and native_contiguous_silu_fp8 is not None:
+        begin, end = padding_bounds
+        return native_contiguous_silu_fp8(
+            gate_up,
+            expert_ids if begin < end else None,
+            expert_end if begin < end else None,
+            begin,
+            end,
+        )
     rows, doubled_width = gate_up.shape
     width = doubled_width // 2
     assert gate_up.dtype == torch.bfloat16 and gate_up.is_contiguous()

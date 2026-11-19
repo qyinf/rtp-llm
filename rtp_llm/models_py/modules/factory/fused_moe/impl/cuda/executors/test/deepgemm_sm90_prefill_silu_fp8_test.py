@@ -15,6 +15,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.test.deepge
     make_payload,
 )
 from rtp_llm.models_py.triton_kernels.moe.sm90_prefill_silu_fp8 import (
+    native_contiguous_silu_fp8,
     silu_mul_native_fp8,
 )
 from rtp_llm.ops.compute_ops import trt_fp8_quantize_128
@@ -121,7 +122,7 @@ class DeepGemmSM90PrefillSiluFp8Test(unittest.TestCase):
     def test_unqualified_paths_do_not_launch_fusion(self):
         executor = self.executor
         executor._sm90_prefill_silu_fp8 = True
-        with patch.object(
+        with patch.object(executor, "_sm90_cuda_contiguous_silu", False), patch.object(
             owner,
             "silu_mul_native_fp8",
             side_effect=AssertionError("unexpected fusion"),
@@ -137,6 +138,27 @@ class DeepGemmSM90PrefillSiluFp8Test(unittest.TestCase):
             executor.enable_cuda_graph = False
             executor._sm90_mn_major_scales = False
             invoke(executor, make_payload(8192), False)
+
+    @unittest.skipUnless(native_contiguous_silu_fp8, "native SiLU-FP8 extension required")
+    def test_cuda_contiguous_executor_rounding_and_dispatch(self):
+        executor = self.executor
+        if not executor._sm90_cuda_contiguous_silu:
+            self.skipTest("H20 required")
+        executor.enable_cuda_graph = False
+        executor._sm90_mn_major_scales = True
+        executor._sm90_prefill_silu_fp8 = True
+        for rows, routing in ((257, "sparse"), (8193, "uniform"), (32769, "skewed")):
+            with self.subTest(rows=rows, routing=routing):
+                payload = make_prefill_payload(rows, routing)
+                with patch.object(executor, "_sm90_cuda_contiguous_silu", False):
+                    expected = invoke(executor, clone_payload(payload), False)
+                with patch.object(
+                    owner, "silu_mul_native_fp8", wraps=silu_mul_native_fp8
+                ) as fused:
+                    actual = invoke(executor, clone_payload(payload), False)
+                fused.assert_called_once()
+                self.assertIsNotNone(fused.call_args.kwargs["padding_bounds"])
+                torch.testing.assert_close(expected, actual, rtol=0, atol=0)
 
     def test_complete_prefill_graph_changed_routes(self):
         executor = self.executor

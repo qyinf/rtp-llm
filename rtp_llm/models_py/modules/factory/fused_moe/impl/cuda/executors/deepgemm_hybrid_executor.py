@@ -58,6 +58,7 @@ from rtp_llm.models_py.triton_kernels.moe.fused_moe_kernel import (
     moe_align_block_size_compiled,
 )
 from rtp_llm.models_py.triton_kernels.moe.sm90_prefill_silu_fp8 import (
+    native_contiguous_silu_fp8,
     silu_mul_native_fp8,
 )
 from rtp_llm.models_py.utils.arch import get_num_device_sms, get_sm
@@ -305,6 +306,11 @@ class DeepGemmHybridExecutor(FusedMoeExpertExecutor):
             and not is_deep_gemm_e8m0_used()
         )
         self._sm90_prefill_silu_fp8 = self._sm90_mn_major_scales
+        self._sm90_cuda_contiguous_silu = (
+            self._sm90_mn_major_scales
+            and native_contiguous_silu_fp8 is not None
+            and "H20" in torch.cuda.get_device_name(self.w13_weight.device)
+        )
         self._sm90_contiguous_prefill_range = (
             self._sm90_mn_major_scales
             and os.environ.get("QWEN_MOE_SM90_CONTIG_PREFILL_RANGE", "1") == "1"
@@ -793,8 +799,15 @@ class DeepGemmHybridExecutor(FusedMoeExpertExecutor):
 
         num_experts_local = num_recv_tokens_per_expert.shape[0]
         token_num = hidden_states_fp8.shape[0]
+        use_cuda_silu = (
+            self._sm90_cuda_contiguous_silu
+            and self._sm90_mn_major_scales
+            and self._sm90_prefill_silu_fp8
+            and not graph_layout
+        )
         mn_major_scales = self._sm90_mn_major_scales and (
             token_num in (8192, 32768)
+            or (use_cuda_silu and self._sm90_contiguous_prefill_range)
             or (
                 self._sm90_contiguous_prefill_range
                 and not graph_layout
@@ -842,11 +855,11 @@ class DeepGemmHybridExecutor(FusedMoeExpertExecutor):
                 )
             elif isinstance(num_recv_tokens_per_expert_cpu, torch.Tensor):
                 num_recv_tokens_per_expert_cpu = num_recv_tokens_per_expert_cpu.tolist()
-            actual_aligned = sum(
+            padded_num_tokens_per_expert = [
                 align_up_math(int(x), expert_alignment)
                 for x in num_recv_tokens_per_expert_cpu
-            )
-            all_tokens = actual_aligned
+            ]
+            all_tokens = sum(padded_num_tokens_per_expert)
             if all_tokens == 0:
                 return CombineForwardPayload(
                     fused_expert_output=torch.zeros(
@@ -890,10 +903,6 @@ class DeepGemmHybridExecutor(FusedMoeExpertExecutor):
         scatter_num_tokens_per_expert = num_recv_tokens_per_expert
         scatter_alignment = expert_alignment
         if not self.is_sm120 and not graph_layout:
-            padded_num_tokens_per_expert = [
-                align_up_math(int(x), expert_alignment)
-                for x in num_recv_tokens_per_expert_cpu
-            ]
             # Reuse one persistent pinned buffer instead of a per-layer
             # cudaHostAlloc; the counts read above synchronized the stream,
             # so the previous layer's H2D from this buffer has drained
@@ -963,11 +972,33 @@ class DeepGemmHybridExecutor(FusedMoeExpertExecutor):
         if mn_major_scales and self._sm90_prefill_silu_fp8:
             gate_up = gateup_output.view(-1, N)
             if self._sm90_contiguous_live_rows and not graph_layout:
+                padding_bounds = None
+                if use_cuda_silu:
+                    counts = num_recv_tokens_per_expert_cpu
+                    padded = padded_num_tokens_per_expert
+                    start, end = 0, all_tokens
+                    first = 0
+                    while first < len(padded) and counts[first] == padded[first]:
+                        start += padded[first]
+                        first += 1
+                    if first == len(padded):
+                        padding_bounds = (0, 0)
+                    else:
+                        last = len(padded) - 1
+                        while counts[last] == padded[last]:
+                            end -= padded[last]
+                            last -= 1
+                        padding_bounds = (start + counts[first], end)
                 down_input_fp8, down_input_scale = silu_mul_native_fp8(
-                    gate_up, expert_ids=m_indices, expert_end=expert_start_loc
+                    gate_up,
+                    expert_ids=m_indices,
+                    expert_end=expert_start_loc,
+                    padding_bounds=padding_bounds,
                 )
             else:
-                down_input_fp8, down_input_scale = silu_mul_native_fp8(gate_up)
+                down_input_fp8, down_input_scale = silu_mul_native_fp8(
+                    gate_up, padding_bounds=(0, 0) if use_cuda_silu else None
+                )
             del gate_up
             del gateup_output
             down_output = torch.empty(
