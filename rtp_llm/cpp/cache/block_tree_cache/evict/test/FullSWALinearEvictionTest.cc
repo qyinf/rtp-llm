@@ -1,3 +1,5 @@
+#include <numeric>
+
 #include <gtest/gtest.h>
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
@@ -53,6 +55,68 @@ protected:
 
     std::unique_ptr<BlockTreeCache> cache_;
 };
+
+TEST_F(FullSWALinearEvictionTest, LinearAllocationShortagePreservesPrefixForRetry) {
+    constexpr size_t page_count = 75;
+    constexpr size_t page_tokens = 64;
+    constexpr size_t linear_budget = 64;
+    constexpr size_t in_flight_blocks = 15 * 4;
+    const auto& linear = cache_->groupSets()[2];
+    const auto& pool = linear->devicePools().front();
+
+    BlockIdList budget(linear_budget);
+    std::iota(budget.begin(), budget.end(), BlockIdxType{1});
+    pool->incRef(budget);
+    pool->decRef(budget);
+
+    CacheKeysType keys(page_count + 1);
+    std::iota(keys.begin(), keys.end(), CacheKeyType{101});
+    std::vector<std::vector<GroupSetResource>> resources(page_count, std::vector<GroupSetResource>(3));
+    for (size_t i = 0; i < page_count; ++i) {
+        resources[i][0].device_blocks = {static_cast<BlockIdxType>(i + 1)};
+        resources[i][1].device_blocks = {static_cast<BlockIdxType>(i + 1)};
+    }
+    auto checkpoint = pool->malloc();
+    ASSERT_TRUE(checkpoint.has_value());
+    resources.back()[2].device_blocks = {*checkpoint};
+    cache_->insert(CacheKeysType(keys.begin(), keys.begin() + page_count), resources, Tier::DEVICE);
+
+    auto in_flight = pool->malloc(in_flight_blocks);
+    ASSERT_TRUE(in_flight.has_value());
+    pool->incRef(*in_flight);
+    ASSERT_EQ(pool->freeBlocksNum(), 3u);
+
+    // The incoming request matches the prefix before trying to allocate four
+    // private blocks. Dropping its checkpoint cannot release a physical block.
+    const auto first_lookup = cache_->match(keys);
+    ASSERT_EQ(first_lookup.matched_device_blocks * page_tokens, 4800u);
+    EXPECT_EQ(cache_->evictForGroup(linear->groupTags().front(), 1), 0);
+    block_tree_cache_test::releaseRequestRefsForTest(*cache_, first_lookup.matched_device_resources);
+
+    // One running request completes before the incoming request retries.
+    const BlockIdList completed(in_flight->begin(), in_flight->begin() + 4);
+    pool->decRef(completed);
+    EXPECT_EQ(pool->freeBlocksNum(), 7u);
+    const auto retry = cache_->match(keys);
+    EXPECT_EQ(retry.matched_device_blocks * page_tokens, 4800u);
+    block_tree_cache_test::releaseRequestRefsForTest(*cache_, retry.matched_device_resources);
+    pool->decRef(BlockIdList(in_flight->begin() + 4, in_flight->end()));
+}
+
+TEST_F(FullSWALinearEvictionTest, LinearAllocationEvictsColdCheckpointInsteadOfPinnedPrefix) {
+    insertPath({100}, 10, 20, 30);
+    const auto pinned = cache_->match({100});
+    ASSERT_EQ(pinned.matched_device_blocks, 1u);
+    insertPath({200}, 11, 21, 31);
+
+    const auto& linear = cache_->groupSets()[2];
+    EXPECT_EQ(cache_->evictForGroup(linear->groupTags().front(), 1), 1);
+    const auto new_match = cache_->match({100});
+    EXPECT_EQ(new_match.matched_device_blocks, 1u);
+    EXPECT_TRUE(cache_->tree()->findNode({200}).empty());
+    block_tree_cache_test::releaseRequestRefsForTest(*cache_, new_match.matched_device_resources);
+    block_tree_cache_test::releaseRequestRefsForTest(*cache_, pinned.matched_device_resources);
+}
 
 TEST_F(FullSWALinearEvictionTest, PromotingExistingPrefixRemovesAllGroupCandidates) {
     insertPath({100, 200, 300}, 10, 20, 30);
